@@ -79,8 +79,8 @@ facts that hold everywhere. `MEMOOSE_DATA_DIR` moves it. Full command table unde
 
 # Give your agent memory
 
-The CLI is enough for an agent with a shell. To add the skills, and on Claude Code the hooks and the
-`memory-keeper` subagent:
+The CLI is enough for an agent with a shell. To add the skills, on Claude Code and Codex the hooks,
+and on Claude Code the `memory-keeper` subagent:
 
 ```sh
 memoose install claude         # or: codex | opencode | cursor
@@ -88,7 +88,8 @@ memoose status                 # what is installed where
 ```
 
 `install` copies the skills into the host. On Claude Code it also registers the hooks in
-`~/.claude/settings.json` and drops the agent into `~/.claude/agents/`. It is user-scoped;
+`~/.claude/settings.json` and drops the agent into `~/.claude/agents/`; on Codex it registers them in
+`~/.codex/hooks.json`, and Codex asks you to trust them once in `/hooks`. It is user-scoped;
 `--project .` scopes it to one repository; `uninstall <host>` reverses it. No MCP server is wired
 unless the agent has no shell: `install <host> --mcp` adds `uvx memoose serve`, which needs
 [uv](https://docs.astral.sh/uv/).

@@ -48,7 +48,7 @@ primary.
    memory is found two ways, by search and by recommendation, and recommendation that has to be
    switched on is not recommendation. The prompt hint recommends before a turn; the Advisor
    recommends during it. The cost is one small-model review per batch of steps, on the host's
-   own auth, the same trade ADR 0003 made for capture. Claude Code only; other hosts keep ADR 0003's jobs. OMP's `syncBacklog` (making the primary
+   own auth, the same trade ADR 0003 made for capture. Claude Code and Codex (ADR 0007); other hosts keep ADR 0003's jobs. OMP's `syncBacklog` (making the primary
    wait for the Advisor) is not ported.
 
 ## Consequences

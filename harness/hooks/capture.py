@@ -13,6 +13,7 @@ and no tool schemas in the keeper's context, which is most of what a capture pro
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -23,6 +24,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import (  # noqa: E402
+    data_dir,
+    detach,
+    host,
     dataset_name,
     dataset_path,
     enabled,
@@ -34,7 +38,7 @@ from _common import (  # noqa: E402
     write_offset,
 )
 
-MODEL = env("CAPTURE_MODEL") or "haiku"
+MODEL = env("CAPTURE_MODEL") or "haiku"  # Claude Code; on Codex, unset means the user's configured model
 MIN_CHARS = int(env("CAPTURE_MIN_CHARS") or "400")
 TIMEOUT_S = int(env("CAPTURE_TIMEOUT") or "300")
 LOCK_STALE_S = 900
@@ -130,6 +134,8 @@ def main() -> int:
     if not enabled():
         return 0
     event = read_event()
+    if detach(event):
+        return 0
     session_id = str(event.get("session_id") or "unknown")
     cwd = event.get("cwd") or os.getcwd()
 
@@ -168,15 +174,23 @@ def _capture_next(session_id: str, cwd: str, transcript: str | None) -> bool | N
             exchange=exchange, today=time.strftime("%Y-%m-%d"),
             dataset=dataset_name(cwd), memoose=_memoose_cmd(),
         )
-        cmd = [
-            "claude", "-p", "--model", MODEL, "--max-turns", "24",
-            "--mcp-config", str(cfg), "--strict-mcp-config",
-            "--allowedTools", "Bash",
-            "--dangerously-skip-permissions",
-        ]
-        plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
-        if plugin_root:
-            cmd += ["--plugin-dir", plugin_root]
+        if host() == "codex":
+            # the keeper writes memory through the CLI, so memory is the one writable root
+            cmd = ["codex", "exec", "--ephemeral", "--skip-git-repo-check",
+                   "-c", 'sandbox_mode="workspace-write"',
+                   "-c", f"sandbox_workspace_write.writable_roots=[{json.dumps(str(data_dir()))}]",
+                   "-c", "mcp_servers={}", "-c", 'model_reasoning_effort="low"',
+                   *(["-m", env("CAPTURE_MODEL")] if env("CAPTURE_MODEL") else []), "-"]
+        else:
+            cmd = [
+                "claude", "-p", "--model", MODEL, "--max-turns", "24",
+                "--mcp-config", str(cfg), "--strict-mcp-config",
+                "--allowedTools", "Bash",
+                "--dangerously-skip-permissions",
+            ]
+            plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+            if plugin_root:
+                cmd += ["--plugin-dir", plugin_root]
         try:
             subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=td,
                            env=_child_env(cwd), timeout=TIMEOUT_S)

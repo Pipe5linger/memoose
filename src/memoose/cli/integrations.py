@@ -1,9 +1,9 @@
 """`memoose install <host>`: put the skills, the hooks and the memory-keeper agent into a host.
 
 The CLI is the surface the skills teach, so an install wires no MCP server unless asked
-(`--mcp`, for hosts whose agent has no shell). Every host gets a copy of harness/skills; Claude Code
-also gets the hooks (registered in its settings) and the memory-keeper agent, which are the two
-things only a plugin used to supply. User scope by default so one install works from every
+(`--mcp`, for hosts whose agent has no shell). Every host gets a copy of harness/skills. Claude Code
+and Codex also get the hooks (registered in `settings.json` and `hooks.json`), and Claude Code the
+memory-keeper agent, which are the things only a plugin used to supply. User scope by default so one install works from every
 repository. When the memoose plugin is installed, hooks and agent are skipped: the plugin already
 provides them, and two registrations would inject every hint twice.
 """
@@ -11,6 +11,7 @@ provides them, and two registrations would inject every hint twice.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from dataclasses import dataclass
@@ -78,7 +79,37 @@ def _copy_tree(src_dir: Path, dst_dir: Path) -> None:
 
 
 def _claude_dir(project: str | None) -> Path:
-    return (Path.home() if project is None else Path(project).resolve()) / ".claude"
+    return _host_dir("claude", project)
+
+
+# Hosts whose hooks memoose registers, and the file each keeps them in. Codex reads Claude's hook
+# shape and event names from its own hooks.json; what differs goes in `_host_hooks`.
+HOOK_FILES = {"claude": ".claude/settings.json", "codex": ".codex/hooks.json"}
+
+
+def _host_dir(host: str, project: str | None) -> Path:
+    if host == "codex" and project is None and os.environ.get("CODEX_HOME"):
+        return Path(os.environ["CODEX_HOME"]).expanduser()
+    return (Path.home() if project is None else Path(project).resolve()) / HOOK_FILES[host].split("/")[0]
+
+
+def _host_hooks(host: str, hooks_dir: Path) -> dict:
+    """harness/hooks/hooks.json, pointed at the copied scripts and adapted to `host`.
+
+    Codex cancels async hooks when its session ends, so the background hooks run synchronously
+    there and detach themselves (`_common.detach`); `--host` tells each script where it runs.
+    """
+    spec = json.loads((HOOKS_ROOT / "hooks.json").read_text())["hooks"]
+    for groups in spec.values():
+        for g in groups:
+            for h in g.get("hooks", []):
+                h["command"] = h["command"].replace("${CLAUDE_PLUGIN_ROOT}/harness/hooks", str(hooks_dir))
+                if host != "claude":
+                    h["command"] += f" --host {host}"
+                    if h.pop("async", False):
+                        h["timeout"] = 10
+                    h.pop("asyncRewake", None)
+    return spec
 
 
 def install(host: str, project: str | None = None, command: list[str] | None = None, mcp: bool = False) -> dict:
@@ -95,33 +126,33 @@ def install(host: str, project: str | None = None, command: list[str] | None = N
         out.update({"mcp_config": str(mcp_path), "command": command})
     else:
         _remove_mcp(kind, mcp_path)
-    if host == "claude":
-        if plugin_install():
-            out["note"] = "the memoose plugin is installed and already supplies the hooks and the memory-keeper agent; not registered twice"
-        else:
-            out.update(_install_claude_hooks_and_agent(_claude_dir(project), with_mcp=mcp))
+    if host == "claude" and plugin_install():
+        out["note"] = "the memoose plugin is installed and already supplies the hooks and the memory-keeper agent; not registered twice"
+    elif host in HOOK_FILES:
+        out.update(_install_hooks(host, _host_dir(host, project), with_mcp=mcp))
+        if host == "codex":
+            out["note"] = "Codex runs a new hook only after you trust it: start codex and review memoose's hooks in /hooks"
     else:
         out["note"] = f"{t.display} has no hook or subagent surface memoose can wire; the skills teach the CLI"
     return out
 
 
-def _install_claude_hooks_and_agent(claude_dir: Path, with_mcp: bool) -> dict:
-    """Copy harness/hooks beside the settings, register them there, and drop the agent in agents/."""
-    hooks_dir = claude_dir / "memoose" / "hooks"
+def _install_hooks(host: str, host_dir: Path, with_mcp: bool) -> dict:
+    """Copy harness/hooks beside the host's config, register them there, and (Claude Code) add the agent."""
+    hooks_dir = host_dir / "memoose" / "hooks"
     _copy_tree(HOOKS_ROOT, hooks_dir)
-    spec = json.loads((HOOKS_ROOT / "hooks.json").read_text())["hooks"]
-    settings_path = claude_dir / "settings.json"
+    settings_path = host_dir / HOOK_FILES[host].split("/")[1]
     settings = _read_json(settings_path) or {}
     hooks = settings.setdefault("hooks", {})
-    for event, groups in spec.items():
+    for event, groups in _host_hooks(host, hooks_dir).items():
         existing = hooks.setdefault(event, [])
         existing[:] = [g for g in existing if not _is_ours(g)]
-        for g in groups:
-            for h in g.get("hooks", []):
-                h["command"] = h["command"].replace("${CLAUDE_PLUGIN_ROOT}/harness/hooks", str(hooks_dir))
-            existing.append(g)
+        existing.extend(groups)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
+    if host != "claude":
+        return {"hooks": str(hooks_dir), "settings": str(settings_path)}
+    claude_dir = host_dir
     agents_dir = claude_dir / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     agents = []
@@ -138,9 +169,9 @@ def _is_ours(group: dict) -> bool:
     return any(HOOK_MARK in h.get("command", "") for h in group.get("hooks", []))
 
 
-def _remove_claude_hooks_and_agent(claude_dir: Path) -> bool:
+def _remove_hooks(host: str, host_dir: Path) -> bool:
     removed = False
-    settings_path = claude_dir / "settings.json"
+    settings_path = host_dir / HOOK_FILES[host].split("/")[1]
     settings = _read_json(settings_path)
     if settings and "hooks" in settings:
         for event, groups in list(settings["hooks"].items()):
@@ -153,12 +184,12 @@ def _remove_claude_hooks_and_agent(claude_dir: Path) -> bool:
         if not settings["hooks"]:
             del settings["hooks"]
         settings_path.write_text(json.dumps(settings, indent=2) + "\n")
-    hooks_dir = claude_dir / "memoose"
+    hooks_dir = host_dir / "memoose"
     if hooks_dir.exists():
         shutil.rmtree(hooks_dir, ignore_errors=True)
         removed = True
-    for src in AGENTS_ROOT.glob("*.md"):
-        agent = claude_dir / "agents" / src.name
+    for src in AGENTS_ROOT.glob("*.md") if host == "claude" else ():
+        agent = host_dir / "agents" / src.name
         if agent.exists():
             agent.unlink()
             removed = True
@@ -173,8 +204,8 @@ def uninstall(host: str, project: str | None = None) -> dict:
             shutil.rmtree(skill_dir.parent / skill_src.name, ignore_errors=True)
     removed_mcp = _remove_mcp(kind, mcp_path)
     out = {"host": t.display, "skill_removed": removed_skill, "mcp_removed": removed_mcp}
-    if host == "claude":
-        out["hooks_removed"] = _remove_claude_hooks_and_agent(_claude_dir(project))
+    if host in HOOK_FILES:
+        out["hooks_removed"] = _remove_hooks(host, _host_dir(host, project))
     return out
 
 
@@ -198,10 +229,12 @@ def status(project: str | None = None) -> dict:
     for host in HOSTS:
         t, skill_dir, mcp_path, kind = _paths(host, project)
         out[host] = {"skill": skill_dir.exists(), "mcp": _has_mcp(kind, mcp_path), "mcp_config": str(mcp_path)}
+        if host in HOOK_FILES:
+            host_dir = _host_dir(host, project)
+            settings = _read_json(host_dir / HOOK_FILES[host].split("/")[1]) or {}
+            out[host]["hooks"] = any(_is_ours(g) for groups in settings.get("hooks", {}).values() for g in groups)
         if host == "claude":
             claude_dir = _claude_dir(project)
-            settings = _read_json(claude_dir / "settings.json") or {}
-            out[host]["hooks"] = any(_is_ours(g) for groups in settings.get("hooks", {}).values() for g in groups)
             out[host]["agent"] = any((claude_dir / "agents" / a.name).exists() for a in AGENTS_ROOT.glob("*.md"))
     return out
 

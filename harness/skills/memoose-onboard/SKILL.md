@@ -93,12 +93,14 @@ three `memoose recall` lines the user can run to check.
 
 ## 4. If the automatic parts do not fire
 
-Hooks come from the Claude Code plugin or from `memoose install claude`; `status` shows which. In
-order of likelihood:
+Hooks come from the Claude Code plugin, `memoose install claude`, or `memoose install codex`;
+`status` shows which. In order of likelihood:
 
-1. The host has no hook surface memoose wires (Codex, OpenCode, Cursor). Use the delegated path: the
+1. The host has no hook surface memoose wires (OpenCode, Cursor). Use the delegated path: the
    `memoose` skill hands memory work to the `memory-keeper` subagent, which needs no hooks.
-2. The host was not restarted after installing.
+2. Codex: a new hook runs only after the user trusts it. Ask them to start `codex` and approve
+   memoose's hooks in `/hooks`; until then Codex skips them without saying so.
+3. The host was not restarted after installing.
 3. The user turned them off; see the switches.
 
 ## 5. The switches
@@ -126,7 +128,7 @@ Background capture writes facts nobody explicitly asked for, so be plain:
 - Two scopes: this project, and a `user` dataset for facts that hold across projects.
 - `memoose recall` shows what is remembered; `memoose history <entity>` shows who stored it and when.
 - `memoose forget` removes an entity, a fact, a session, or a whole dataset.
-- On Claude Code an Advisor watches the work: a small model reviews each step against memory and
+- On Claude Code and Codex an Advisor watches the work: a small model reviews each step against memory and
   `WATCHDOG.md` and can interrupt with an `<advisory>`. It reads, never writes. `MEMOOSE_ADVISOR=0` turns it off.
 
 Offer a `recall` over anything they are unsure about, and ask before enabling capture if the project

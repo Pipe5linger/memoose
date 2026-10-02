@@ -7,6 +7,7 @@ def _home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(integrations.Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(integrations, "plugin_install", lambda: None)  # no plugin on this fake machine
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
 def test_install_puts_skills_everywhere_and_hooks_plus_agent_into_claude(tmp_path, monkeypatch):

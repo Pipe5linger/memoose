@@ -37,11 +37,11 @@ import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import complete_lines, connect, data_dir, dataset_name, dataset_path, env, read_event, read_offset, write_offset  # noqa: E402
-from advise import _path, advisor_on, mark_delivered, pending, render, session_state  # noqa: E402
+from _common import complete_lines, connect, detach, host, transcript_message, data_dir, dataset_name, dataset_path, env, read_event, read_offset, write_offset  # noqa: E402
+from advise import _path, advisor_on, emit, mark_delivered, pending, render, session_state  # noqa: E402
 from capture import _lock, _memoose_cmd, _no_mcp_config  # noqa: E402
 
-MODEL = env("ADVISOR_MODEL") or "haiku"
+MODEL = env("ADVISOR_MODEL")  # unset: haiku on Claude Code, the user's configured model on Codex
 TIMEOUT_S = int(env("ADVISOR_TIMEOUT") or "300")
 RESET_AFTER = int(env("ADVISOR_RESET_AFTER") or "40")  # ponytail: a review count, not a token estimate
 MAX_FAILURES = 3  # consecutive failed reviews before the advisor halts for the session, as in OMP
@@ -61,14 +61,13 @@ Cover skipped angles; NEVER re-run reasoning agent already has. Advise before wr
 <workflow>
 Receive incremental agent transcript as `### Session update` messages, including tool calls and results.
 The agent works in {project}; give Read, Grep and Glob absolute paths under it.
-Verify suspicions with your read-only tools: Read, Grep, Glob, and project memory through
+Verify suspicions with your read-only tools: {tools}, and project memory through
 `{memoose} recall "<question>" --dataset {dataset}` (decisions, conventions, rules, and Pitfalls
 from earlier sessions). Memory is where you see what the agent does not: when the agent is about to
 contradict a stored decision, rule or Pitfall, say so and cite the stored fact.
 Per advisory: 2–3 tool calls. Critical bugs MAY need deeper verification before a `blocker`.
-Send advice ONLY by running: {advise} <nit|concern|blocker> "<one concrete, terse note>"
-Use it sparingly; stay silent when nothing matters. Call it to avert likely-wrong or materially wasteful work.
-After you advise or decide to stay silent, end your reply with one word: done.
+{emit}
+Advise sparingly; stay silent when nothing matters. Advise to avert likely-wrong or materially wasteful work.
 </workflow>
 
 <communication>
@@ -138,10 +137,28 @@ def project_context(cwd: str) -> str:
     return "\n\n".join(f.read_text(errors="replace").strip() for f in files if f.is_file())
 
 
-def system_prompt(cwd: str) -> str:
+# How the advisor emits an Advisory differs by host. Claude Code can allow exactly one script, so
+# the advisor calls it and the guard answers each note. Codex has no per-command allowlist, so its
+# advisor answers in JSON against a schema and the runner puts each note through the same guard.
+EMIT = {
+    "claude": ('Send advice ONLY by running: python3 {advise} <nit|concern|blocker> "<one concrete, terse note>"\n'
+               "After you advise or decide to stay silent, end your reply with one word: done."),
+    "codex": ('End every reply with JSON matching the given schema: {{"advisories": [{{"severity": '
+              '"nit"|"concern"|"blocker", "note": "<one concrete, terse note>"}}]}}. An empty list is silence.'),
+}
+TOOLS = {"claude": "Read, Grep, Glob",
+         "codex": "shell commands that only read (cat, rg, ls, git log); the sandbox forbids writing the project"}
+SCHEMA = {"type": "object", "additionalProperties": False, "required": ["advisories"], "properties": {
+    "advisories": {"type": "array", "items": {"type": "object", "additionalProperties": False,
+                   "required": ["severity", "note"], "properties": {
+                       "severity": {"type": "string", "enum": ["nit", "concern", "blocker"]},
+                       "note": {"type": "string"}}}}}}
+
+
+def system_prompt(cwd: str, agent: str = "claude") -> str:
     from advise import MAX_NOTES
-    parts = [SYSTEM.format(memoose=_memoose_cmd(), dataset=dataset_name(cwd), project=cwd,
-                           advise=f"python3 {shlex.quote(ADVISE)}", max_notes=MAX_NOTES)]
+    parts = [SYSTEM.format(memoose=_memoose_cmd(), dataset=dataset_name(cwd), project=cwd, tools=TOOLS[agent],
+                           emit=EMIT[agent].format(advise=shlex.quote(ADVISE)), max_notes=MAX_NOTES)]
     if project := project_context(cwd):
         parts.append(f"<project-context>\n{project}\n</project-context>")
     if memory := standing_memory(cwd):
@@ -187,62 +204,101 @@ def read_delta(transcript_path: str | None, start: int) -> tuple[str, int, bool]
             d = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if d.get("type") not in ("user", "assistant") or d.get("isMeta"):
+        m = transcript_message(d)
+        if m is None:
             continue
-        content = (d.get("message") or {}).get("content")
-        blocks = [{"type": "text", "text": content}] if isinstance(content, str) else content or []
+        role, blocks = m
         parts = [s for s in (_render_block(b) for b in blocks if isinstance(b, dict)) if s.strip()]
         text = "\n".join(parts).strip()
         if not text or text.startswith("<system-reminder") or "<advisory " in text:
             continue  # injected text, and the advisor's own advice coming back
-        entry = _clip(f"{'User' if d['type'] == 'user' else 'Agent'}: {text}", DELTA_CHARS)
+        entry = _clip(f"{'User' if role == 'user' else 'Agent'}: {text}", DELTA_CHARS)
         if out and size + len(entry) > DELTA_CHARS:
             return "\n\n".join(out), i, True  # the rest is the next batch; more follows, so mid-turn
         out.append(entry)
         size += len(entry) + 2
         # the turn is over once the agent's last message calls no tool
-        mid_turn = d["type"] == "user" or any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)
+        mid_turn = role == "user" or any(isinstance(b, dict) and b.get("type") == "tool_use" for b in blocks)
     return "\n\n".join(out), len(lines), mid_turn
 
 
 # ----- one review ----------------------------------------------------------------------------------
-def review(session_id: str, cwd: str, delta: str, mid_turn: bool) -> bool:
-    """Send one delta to the advisor. True when the advisor ran."""
-    with session_state(session_id) as st:
-        adv = st.setdefault("advisor", {})
-        if not adv.get("id") or adv.get("reviews", 0) >= RESET_AFTER:
-            adv.update(id=str(uuid.uuid4()), reviews=0, started=False)
-        adv["update"] = adv.get("update", 0) + 1
-        advisor_id, resume, update = adv["id"], adv["started"], adv["update"]
+def _claude_review(advisor_id: str | None, resume: bool, cwd: str, home: Path, prompt: str, child: dict) -> str | None:
+    advisor_id = advisor_id or str(uuid.uuid4())
     memoose = _memoose_cmd()
-    # A fixed directory per session: `--resume` finds a session only from the cwd that made it, and
-    # running outside the project keeps the advisor's transcripts out of the user's session list.
-    home = _path(session_id, "d")
-    home.mkdir(exist_ok=True)
-    cmd = ["claude", "-p", "--model", MODEL,
+    cmd = ["claude", "-p", "--model", MODEL or "haiku",
            *(["--resume", advisor_id] if resume else ["--session-id", advisor_id]),
            "--append-system-prompt", system_prompt(cwd), "--add-dir", cwd,
            "--mcp-config", str(_no_mcp_config(home)), "--strict-mcp-config",
            "--allowedTools", "Read", "Grep", "Glob",
            f"Bash({memoose} recall:*)", f"Bash(python3 {shlex.quote(ADVISE)}:*)"]
+    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=home, env=child, timeout=TIMEOUT_S)
+    return advisor_id if r.returncode == 0 else None
+
+
+def _codex_review(advisor_id: str | None, resume: bool, cwd: str, home: Path, prompt: str, child: dict,
+                  session_id: str, update: int) -> str | None:
+    """`codex exec`, then `codex exec resume <thread>`: the project is readable, only memory is writable."""
+    schema, answer = home / "schema.json", home / "answer.json"
+    schema.write_text(json.dumps(SCHEMA))
+    answer.unlink(missing_ok=True)
+    if not resume:
+        prompt = f"{system_prompt(cwd, 'codex')}\n\n{prompt}"  # codex exec has no system-prompt flag; it stays in the thread
+    cmd = ["codex", "exec", *(["resume", advisor_id] if resume else []), "--json", "--skip-git-repo-check",
+           "-c", 'sandbox_mode="workspace-write"',
+           "-c", f"sandbox_workspace_write.writable_roots=[{json.dumps(str(data_dir()))}]",
+           "-c", "mcp_servers={}", "-c", 'model_reasoning_effort="low"',
+           *(["-m", MODEL] if MODEL else []),
+           "--output-schema", str(schema), "-o", str(answer), "-"]
+    r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=home, env=child, timeout=TIMEOUT_S)
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        if '"thread.started"' in line:
+            advisor_id = json.loads(line).get("thread_id") or advisor_id
+            break
+    try:
+        advisories = json.loads(answer.read_text()).get("advisories", [])
+    except (OSError, ValueError, AttributeError):
+        advisories = []
+    for a in advisories:
+        if isinstance(a, dict):
+            emit(session_id, str(update), str(a.get("severity", "")), str(a.get("note", "")))
+    return advisor_id
+
+
+def review(session_id: str, cwd: str, delta: str, mid_turn: bool) -> bool:
+    """Send one delta to the advisor. True when the advisor ran."""
+    with session_state(session_id) as st:
+        adv = st.setdefault("advisor", {})
+        if not adv.get("started") or adv.get("reviews", 0) >= RESET_AFTER:
+            adv.update(id=None, reviews=0, started=False)
+        adv["update"] = adv.get("update", 0) + 1
+        advisor_id, resume, update = adv["id"], adv["started"], adv["update"]
+    # A fixed directory per session: a resumed session is found from the cwd that made it, and
+    # running outside the project keeps the advisor's transcripts out of the user's session list.
+    home = _path(session_id, "d")
+    home.mkdir(exist_ok=True)
     child = {**os.environ, "MEMOOSE_PROJECT_DIR": cwd, "MEMOOSE_ADVISOR_SESSION": session_id,
              "MEMOOSE_ADVISOR_UPDATE": str(update),
              # the advisor's own session must not advise, capture, or hint itself
              "MEMOOSE_ADVISOR": "0", "MEMOOSE_AUTO_CAPTURE": "0", "MEMOOSE_HINTS": "0",
              "MEMOOSE_AUTO_RECALL": "0"}
+    prompt = f"### Session update\n\n{delta}{WIP if mid_turn else ''}"
     try:
-        r = subprocess.run(cmd, input=f"### Session update\n\n{delta}{WIP if mid_turn else ''}",
-                           capture_output=True, text=True, cwd=home, env=child, timeout=TIMEOUT_S)
-        ok = r.returncode == 0
+        if host() == "codex":
+            advisor_id = _codex_review(advisor_id, resume, cwd, home, prompt, child, session_id, update)
+        else:
+            advisor_id = _claude_review(advisor_id, resume, cwd, home, prompt, child)
     except (OSError, subprocess.SubprocessError):
-        ok = False
+        advisor_id = None
     with session_state(session_id) as st:
         adv = st.setdefault("advisor", {})
-        if ok:
-            adv.update(started=True, reviews=adv.get("reviews", 0) + 1, failures=0)
+        if advisor_id:
+            adv.update(id=advisor_id, started=True, reviews=adv.get("reviews", 0) + 1, failures=0)
         else:
             adv["failures"] = adv.get("failures", 0) + 1
-    return ok
+    return bool(advisor_id)
 
 
 def halted(session_id: str) -> bool:
@@ -268,6 +324,8 @@ def main() -> int:
     if not advisor_on():
         return 0
     event = read_event()
+    if detach(event):
+        return 0
     session_id = str(event.get("session_id") or "unknown")
     cwd = event.get("cwd") or os.getcwd()
     transcript = event.get("transcript_path")
@@ -285,8 +343,8 @@ def main() -> int:
         # a step that arrived between the last check and the unlock found the lock held; take it
         if read_delta(transcript, read_offset(key))[1] <= read_offset(key):
             break
-    if mid_turn:
-        return 0  # the next PostToolUse or Stop delivers
+    if mid_turn or host() != "claude":
+        return 0  # the next PostToolUse, Stop or prompt delivers; only Claude Code can wake an idle session
     time.sleep(1)  # let a Stop hook that is still running take its blockers first
     with session_state(session_id) as st:
         late = [a for a in pending(st) if a["severity"] == "blocker"]

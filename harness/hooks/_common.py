@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -77,8 +78,80 @@ def enabled(var: str = "AUTO_CAPTURE") -> bool:
     return (env(var) or "1").strip().lower() not in ("0", "false", "off", "no")
 
 
+# ----- hosts -----------------------------------------------------------------------------
+# Every host whose hooks memoose wires. The hook scripts are the same for all of them; what differs
+# is named here and in `transcript_message`: how the host says which one it is, what its transcript
+# lines look like, and whether its background hooks outlive the session.
+HOSTS = ("claude", "codex")
+
+
+def host() -> str:
+    """The client that ran this hook: `--host <id>` on the hook's command, else Claude Code.
+
+    The installer adds the flag for every host but Claude Code, whose plugin hooks carry none.
+    """
+    argv = sys.argv
+    if "--host" in argv[:-1]:
+        name = argv[argv.index("--host") + 1]
+        return name if name in HOSTS else "claude"
+    return env("HOST") or "claude"
+
+
+def detach(event: dict) -> bool:
+    """Re-run this hook in the background, detached, on hosts that kill background hooks early.
+
+    Codex cancels an async hook when its session ends, which for `codex exec` is right after the
+    last Stop, the one capture most needs. Returns True in the parent, which should exit at once;
+    the child runs with `--bg` and does the work. Claude Code keeps async hooks alive, and its
+    `asyncRewake` reads the hook's own exit code, so it never detaches.
+    """
+    if host() == "claude" or "--bg" in sys.argv:
+        return False
+    try:
+        child = subprocess.Popen([sys.executable, *sys.argv, "--bg"], stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        child.stdin.write(json.dumps(event).encode())
+        child.stdin.close()
+    except OSError:
+        return False
+    return True
+
+
 # ----- transcript ---------------------------------------------------------------------
 _SKIP_PREFIXES = ("<system-reminder", "<local-command", "<command-name", "Caveat:")
+
+
+def transcript_message(d: dict) -> tuple[str, list[dict]] | None:
+    """One transcript line as (role, content blocks in Claude's shape), or None if it is not speech.
+
+    Claude Code writes `{"type": "user"|"assistant", "message": {"content": ...}}`. Codex writes
+    rollout lines, `{"type": "response_item", "payload": {...}}`, where tool calls and their
+    outputs are items of their own and the host's injected context (hook output, environment,
+    plugin lists) arrives as `developer` messages or as user text wrapped in a tag.
+    """
+    kind = d.get("type")
+    if kind in ("user", "assistant"):
+        if d.get("isMeta"):
+            return None
+        c = (d.get("message") or {}).get("content")
+        blocks = [{"type": "text", "text": c}] if isinstance(c, str) else [b for b in c or [] if isinstance(b, dict)]
+        return kind, blocks
+    if kind != "response_item":
+        return None
+    p = d.get("payload") or {}
+    t = p.get("type")
+    if t == "message" and p.get("role") in ("user", "assistant"):
+        texts = [c.get("text") or "" for c in p.get("content") or [] if isinstance(c, dict)]
+        texts = [x for x in texts if x.strip() and not x.lstrip().startswith("<")]
+        return (p["role"], [{"type": "text", "text": x} for x in texts]) if texts else None
+    if t in ("function_call", "custom_tool_call"):
+        return "assistant", [{"type": "tool_use", "name": p.get("name"), "input": p.get("arguments", p.get("input"))}]
+    if t in ("function_call_output", "custom_tool_call_output"):
+        out = p.get("output")
+        if isinstance(out, list):
+            out = "\n".join(x.get("text", "") for x in out if isinstance(x, dict))
+        return "user", [{"type": "tool_result", "content": out if isinstance(out, str) else json.dumps(out)}]
+    return None
 
 
 def _blocks_text(content) -> tuple[str, bool]:
@@ -141,15 +214,16 @@ def read_exchange(transcript_path: str | None, start_line: int = 0, max_chars: i
             d = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if d.get("type") not in ("user", "assistant"):
+        m = transcript_message(d)
+        if m is None:
             continue
-        msg = d.get("message") or {}
-        text, had_tools = _blocks_text(msg.get("content"))
+        role, blocks = m
+        text, had_tools = _blocks_text(blocks)
         text = text.strip()
         if not text or text.startswith(_SKIP_PREFIXES):
             tools = tools or had_tools
             continue
-        role = "User" if d["type"] == "user" else "Assistant"
+        role = "User" if role == "user" else "Assistant"
         entry = f"{role}: {text}"[:max_chars]
         if out and size + len(entry) + 2 > max_chars:
             return "\n\n".join(out), i, tools
