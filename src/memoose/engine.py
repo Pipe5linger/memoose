@@ -563,7 +563,9 @@ class Engine:
         names = [normalize_dataset_name(d) for d in datasets] if datasets else [self.default_dataset_name()]
         if include_user and USER_DATASET not in names and not datasets:
             names.append(USER_DATASET)
-        results = [self.dataset(n).recall(query, mode=mode, limit=limit, include_superseded=include_superseded, hops=hops) for n in names]
+        first = self.dataset(names[0]).recall(query, mode=mode, limit=limit, include_superseded=include_superseded, hops=hops)
+        mode = mode or first["mode"]  # routed once: every Dataset answers the same question the same way
+        results = [first] + [self.dataset(n).recall(query, mode=mode, limit=limit, include_superseded=include_superseded, hops=hops) for n in names[1:]]
         merged = dict(results[0])
         merged["datasets"] = names
         reserve = max(1, limit // 4)

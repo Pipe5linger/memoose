@@ -1,6 +1,6 @@
 [project]
 name = "memoose"
-version = "0.5.1"
+version = "0.6.0"
 description = "A dual-path memory system for proactive agents: facts and procedures in a local graph, exposed as a CLI, MCP tools and skills, no API key."
 readme = "README.md"
 license = "Apache-2.0"
@@ -10,7 +10,9 @@ keywords = ["memory", "mcp", "agent-plugins", "knowledge-graph", "claude-code", 
 dependencies = [
   "mcp>=1.10",
   "numpy>=1.26",
+  "onnxruntime>=1.18",
   "pydantic>=2.7",
+  "tokenizers>=0.19",
 ]
 
 [project.optional-dependencies]

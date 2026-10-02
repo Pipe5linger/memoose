@@ -39,7 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import complete_lines, connect, detach, host, transcript_message, data_dir, dataset_name, dataset_path, env, read_event, read_offset, write_offset  # noqa: E402
 from advise import _path, advisor_on, emit, mark_delivered, pending, render, session_state  # noqa: E402
-from capture import _lock, _memoose_cmd, _no_mcp_config  # noqa: E402
+from capture import _lock, _memoose_cmd, _no_mcp_config, decide, decider_mode  # noqa: E402
 
 MODEL = env("ADVISOR_MODEL")  # unset: haiku on Claude Code, the user's configured model on Codex
 TIMEOUT_S = int(env("ADVISOR_TIMEOUT") or "300")
@@ -306,8 +306,19 @@ def halted(session_id: str) -> bool:
         return st.get("advisor", {}).get("failures", 0) >= MAX_FAILURES
 
 
-def drain(session_id: str, cwd: str, transcript: str | None) -> bool:
-    """Review until the cursor reaches the transcript's end. Returns whether the primary is mid-turn."""
+def mail_count(session_id: str) -> int:
+    with session_state(session_id) as st:
+        return len(st.get("mail", []))
+
+
+def drain(session_id: str, cwd: str, transcript: str | None, gate: bool = False) -> tuple[bool, bool]:
+    """Review until the cursor reaches the transcript's end. Returns (primary mid-turn, deferred).
+
+    `gate` (a PostToolUse step, with the decider on): a mid-turn delta the decision model calls
+    safe is deferred, not dropped. The cursor stays, so the review at the end of the turn sees it.
+    That is the advisor's own mid-turn policy (only a blocker may interrupt partial work), made
+    before a review is paid for instead of by the review.
+    """
     key, mid_turn = f"advisor-{session_id}", True
     while not halted(session_id):
         start = read_offset(key)
@@ -315,9 +326,16 @@ def drain(session_id: str, cwd: str, transcript: str | None) -> bool:
         if end <= start:
             break
         if delta:
-            review(session_id, cwd, delta, mid_turn)
+            if gate and mid_turn and decider_mode() == "on":
+                verdict = decide("advise", delta)
+                if verdict is not None and not verdict["yes"]:
+                    return mid_turn, True
+            before = mail_count(session_id)
+            ran = review(session_id, cwd, delta, mid_turn)
+            if ran and mid_turn and decider_mode() == "shadow":
+                decide("advise", delta, actual=mail_count(session_id) > before)
         write_offset(key, end)  # a failed review drops its batch, as OMP does after its retries
-    return mid_turn
+    return mid_turn, False
 
 
 def main() -> int:
@@ -335,11 +353,11 @@ def main() -> int:
         if lock is None:
             return 0  # the holder drains everything, this step included
         try:
-            mid_turn = drain(session_id, cwd, transcript)
+            mid_turn, deferred = drain(session_id, cwd, transcript, gate=event.get("hook_event_name") == "PostToolUse")
         finally:
             lock.unlink(missing_ok=True)
-        if halted(session_id):
-            return 0
+        if halted(session_id) or deferred:
+            return 0  # deferred: unread lines are expected, the end-of-turn review takes them
         # a step that arrived between the last check and the unlock found the lock held; take it
         if read_delta(transcript, read_offset(key))[1] <= read_offset(key):
             break

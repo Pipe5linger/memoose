@@ -13,6 +13,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 
+from .. import decider
 from ..store.embeddings import Embedder
 from ..store.sqlite_store import Hit, RelationRow, SqliteStore
 
@@ -30,6 +31,8 @@ class Route:
 class Router:
     """Picks a retrieval mode from the wording of the query. Highest summed weight wins; default hybrid."""
 
+    MIN_CONFIDENCE = 0.5
+
     RULES: list[tuple[re.Pattern, str, float]] = [
         (re.compile(r'^"[^"]+"$'), "lexical", 3.0),
         (re.compile(r"\b(exact|verbatim|literal|word.for.word)\b", re.I), "lexical", 2.0),
@@ -46,6 +49,23 @@ class Router:
     ]
 
     def route(self, query: str) -> Route:
+        """The rules when a cue matched, else the decision model (it reads any wording), else hybrid.
+
+        The model is asked only where the rules are blind: a CLI recall that loads it costs ~1.4 s
+        more. An answer below MIN_CONFIDENCE keeps hybrid, the default that searches every channel.
+        """
+        rules = self.rule_route(query)
+        if rules.matched or decider.mode() == "off":
+            return rules
+        answer = decider.consult("route", query, actual=rules.mode)
+        if answer is None or decider.mode() == "shadow":
+            return rules  # recorded only, or failed (the failure is recorded)
+        ranked = sorted(answer["probabilities"].items(), key=lambda x: x[1], reverse=True)
+        if ranked[0][1] < self.MIN_CONFIDENCE:
+            return rules
+        return Route(ranked[0][0], ranked[0][1], ranked[1][0], ["decider"])
+
+    def rule_route(self, query: str) -> Route:
         scores: dict[str, float] = defaultdict(float)
         matched: list[str] = []
         for pattern, mode, weight in self.RULES:
@@ -71,7 +91,8 @@ class Recaller:
         self.router = Router()
 
     def recall(self, query: str, mode: str | None = None, limit: int = 10, include_superseded: bool = False, hops: int = 1) -> dict:
-        route = self.router.route(query)
+        # an explicit mode needs no judgment; the rules still report what they would have picked
+        route = self.router.route(query) if mode is None else self.router.rule_route(query)
         mode = mode or route.mode
         if mode not in MODES:
             raise ValueError(f"Unknown search mode {mode!r}. Use one of: {', '.join(MODES)}.")

@@ -37,6 +37,9 @@ Say what is missing and what you will run, ask once, then run it:
   On Claude Code, the plugin is the alternative that keeps one copy of everything:
   `/plugin marketplace add AndrewNgo-ini/memoose` then `/plugin install memoose@memoose`.
 - Agent has no shell: add `--mcp`, which registers `uvx memoose serve`.
+- Decision model missing (`memoose status` shows `"decider": {"fetched": false}`, as after a plugin
+  install): `memoose decide --fetch`, a one-time ~0.65 GB download. Until then the capture gate,
+  the Advisor gate and the recall router use their heuristics. `memoose install` fetches it itself.
 
 Tell the user the host must restart before hooks and the server load, and carry on with step 3,
 which needs only the CLI. Do not edit host configuration by hand; `install` and `uninstall` are the
@@ -117,6 +120,7 @@ environment:
 | `MEMOOSE_CAPTURE_MODEL=haiku` | which small model does background extraction |
 | `MEMOOSE_CAPTURE_MIN_CHARS=400` | how substantial a turn must be before capture runs |
 | `MEMOOSE_ADVISOR=0` | no Advisor: the second small-model session that reviews each step of the work, with memory and `WATCHDOG.md`, and injects Advisories into the running turn (ADR 0006). `MEMOOSE_ADVISOR_MODEL=haiku` picks its model |
+| `MEMOOSE_DECIDER=on\|shadow\|off` | the local decision model that gates capture and mid-turn Advisor reviews and routes recall (ADR 0008). `shadow` only records; `memoose decide --report` compares it with what happened |
 | `MEMOOSE_DATA_DIR` | where the memory files live |
 | `MEMOOSE_EMBEDDER=hash\|fastembed\|auto` | local embeddings; `hash` needs no model download |
 

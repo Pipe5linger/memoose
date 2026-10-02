@@ -112,6 +112,32 @@ def _memoose_cmd() -> str:
     return shutil.which("memoose") or f'uvx --from "{_plugin_root()}" memoose'
 
 
+def decider_mode() -> str:
+    """`MEMOOSE_DECIDER`: on (default), shadow (record only) or off. Mirrors `memoose.decider.mode`."""
+    m = (env("DECIDER") or "on").strip().lower()
+    return m if m in ("off", "shadow", "on") else "on"
+
+
+def decide(name: str, state: str, actual: bool | str | None = None) -> dict | None:
+    """Ask the local decision model through `memoose decide`. None when off or when it failed.
+
+    A failure is recorded by `memoose decide` itself (`--report` shows it), and the caller's
+    heuristic decides, so a missing extra or an unfetched model never stops a gate.
+    """
+    if decider_mode() == "off":
+        return None
+    cmd = shutil.which("memoose")
+    cmd = [cmd] if cmd else ["uvx", "--from", _plugin_root(), "memoose"]
+    cmd += ["decide", name]
+    if actual is not None:
+        cmd += ["--actual", str(actual).lower() if isinstance(actual, bool) else actual]
+    try:
+        r = subprocess.run(cmd, input=state, capture_output=True, text=True, timeout=120)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def _child_env(cwd: str) -> dict:
     """The store the keeper must write to, passed down so its shell commands agree with ours.
 
@@ -167,6 +193,11 @@ def _capture_next(session_id: str, cwd: str, transcript: str | None) -> bool | N
     if len(exchange) < MIN_CHARS:
         write_offset(session_id, new_offset)
         return True
+    # The decision model's gate, when on: a slice it calls transient never reaches the keeper.
+    gate = decide("capture", exchange) if decider_mode() == "on" else None
+    if gate is not None and not gate["yes"]:
+        write_offset(session_id, new_offset)
+        return True
     with tempfile.TemporaryDirectory(prefix="memoose-capture-") as td:
         tmp = Path(td)
         cfg = _no_mcp_config(tmp)
@@ -192,10 +223,14 @@ def _capture_next(session_id: str, cwd: str, transcript: str | None) -> bool | N
             if plugin_root:
                 cmd += ["--plugin-dir", plugin_root]
         try:
-            subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=td,
-                           env=_child_env(cwd), timeout=TIMEOUT_S)
+            r = subprocess.run(cmd, input=prompt, capture_output=True, text=True, cwd=td,
+                               env=_child_env(cwd), timeout=TIMEOUT_S)
         except (OSError, subprocess.SubprocessError):
             return None  # claude missing or failed: silent, memory is best-effort; the slice is retried
+    if decider_mode() == "shadow" and r.returncode == 0:
+        # the keeper's verdict is the label: it stored something, or its last line is NOTHING
+        last = (r.stdout or "").strip().splitlines()[-1:]
+        decide("capture", exchange, actual="durable" if last != ["NOTHING"] else "transient")
     write_offset(session_id, new_offset)
     return True
     return 0

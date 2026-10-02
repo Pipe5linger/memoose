@@ -1,5 +1,11 @@
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _decider_off(monkeypatch):
+    """The decision model is on by default; tests opt in, so a fetched model never changes a result."""
+    monkeypatch.setenv("MEMOOSE_DECIDER", "off")
+
 from memoose.store.embeddings import HashEmbedder
 from memoose.engine import Engine
 

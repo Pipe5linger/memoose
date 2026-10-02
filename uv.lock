@@ -633,13 +633,15 @@ wheels = [
 
 [[package]]
 name = "memoose"
-version = "0.5.1"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "onnxruntime" },
     { name = "pydantic" },
+    { name = "tokenizers" },
 ]
 
 [package.optional-dependencies]
@@ -661,8 +663,10 @@ requires-dist = [
     { name = "fastembed", marker = "extra == 'fastembed'", specifier = ">=0.5" },
     { name = "mcp", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "onnxruntime", specifier = ">=1.18" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "rdflib", marker = "extra == 'ontology'", specifier = ">=7" },
+    { name = "tokenizers", specifier = ">=0.19" },
 ]
 provides-extras = ["fastembed", "ontology"]
 

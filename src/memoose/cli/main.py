@@ -358,6 +358,32 @@ def cmd_tool(engine: Engine, args: argparse.Namespace) -> dict:
     return result if isinstance(result, dict) else {"result": result}
 
 
+def cmd_decide(args: argparse.Namespace) -> int:
+    """No Engine: a decision reads no Dataset, and the hooks call this once per gate."""
+    from .. import decider
+
+    if args.fetch:
+        print(json.dumps({"model": str(decider.fetch(lambda m: print(m, file=sys.stderr)))}))
+        return 0
+    if args.report:
+        print(json.dumps(decider.report(), indent=2))
+        return 0
+    if not args.decision:
+        print("DeciderError: name a decision, or pass --fetch or --report", file=sys.stderr)
+        return 1
+    actual = {"true": True, "false": False}.get(args.actual, args.actual)
+    state = sys.stdin.read()
+    try:
+        answer = decider.decide(args.decision, state)
+    except decider.DeciderError as e:
+        decider.record(args.decision, state, None, actual, error=str(e))
+        print(f"DeciderError: {e}", file=sys.stderr)
+        return 1
+    decider.record(args.decision, state, answer, actual)
+    print(json.dumps(answer, ensure_ascii=False))
+    return 0
+
+
 # ----- parser -----------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="memoose", description="A dual-path memory system for proactive agents. Facts and procedures in one local SQLite file.")
@@ -451,12 +477,19 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("name")
     t.add_argument("--stdin", action="store_true", help="Read keyword arguments as a JSON object on stdin.")
 
+    dc = sub.add_parser("decide", help="Run one decision on the local decision model (state on stdin), fetch the model, or report how its decisions compared.")
+    dc.add_argument("decision", nargs="?", default=None, help="capture, advise or route.")
+    dc.add_argument("--actual", default=None, help="What actually happened, recorded next to the answer (shadow mode).")
+    dc.add_argument("--fetch", action="store_true", help="Download the model once (~0.65 GB).")
+    dc.add_argument("--report", action="store_true", help="Per decision: runs, errors, agreement with what happened.")
+
     sub.add_parser("serve", help="Run the stdio MCP server (what a host launches).")
     pi = sub.add_parser("install", help="Install the skills, hooks and the memory-keeper agent into a host. The agent then uses the CLI; --mcp also wires the MCP server.")
     pi.add_argument("host", choices=HOSTS)
     pi.add_argument("--project", nargs="?", const=".", default=None)
     pi.add_argument("--mcp", action="store_true", help="Also register the MCP server, for an agent that has no shell.")
     pi.add_argument("--command", default=None, help='With --mcp: server command override, e.g. "uvx memoose serve".')
+    pi.add_argument("--no-model", action="store_true", help="Skip fetching the local decision model (~0.65 GB); the gates fall back to their heuristics.")
     pu = sub.add_parser("uninstall", help="Remove memoose from a host.")
     pu.add_argument("host", choices=HOSTS)
     pu.add_argument("--project", nargs="?", const=".", default=None)
@@ -479,15 +512,27 @@ def main(argv: list[str] | None = None) -> int:
         build_server().run("stdio")
         return 0
 
+    if args.cmd == "decide":
+        return cmd_decide(args)
+
     if args.cmd in ("install", "uninstall", "status"):
         from . import integrations
 
+        from .. import decider
+
         if args.cmd == "install":
             result = integrations.install(args.host, project=args.project, command=args.command.split() if args.command else None, mcp=args.mcp or bool(args.command))
+            if not args.no_model:
+                try:
+                    result["decider"] = str(decider.fetch(lambda m: print(m, file=sys.stderr)))
+                except OSError as e:  # the host install stands; only the model is missing, and the gates say so
+                    result["decider"] = f"not fetched ({e}); run `memoose decide --fetch` later"
         elif args.cmd == "uninstall":
             result = integrations.uninstall(args.host, project=args.project)
         else:
             result = integrations.status(project=args.project)
+            result["decider"] = {"mode": decider.mode(), "model": str(decider.model_dir()),
+                                 "fetched": (decider.model_dir() / decider.FILES[-1]).exists()}
         print(json.dumps(result, indent=2))
         return 0
 
